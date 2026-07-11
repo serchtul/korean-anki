@@ -3,22 +3,30 @@
 korean-anki: manage a Korean vocabulary Anki deck from the command line.
 
 Usage:
-  uv run anki_korean.py parse lesson.txt   # parse a chat export
+  uv run anki_korean.py parse lesson.txt   # parse a chat export, then auto-sync new words
+  uv run anki_korean.py parse lesson.txt --no-sync  # parse only, skip auto-sync
   uv run anki_korean.py add "야근=overwork" # manually add a word
-  uv run anki_korean.py build              # generate korean_deck.apkg
+  uv run anki_korean.py build              # generate korean_deck.apkg (manual import fallback)
+  uv run anki_korean.py sync               # push directly into running Anki + AnkiWeb
   uv run anki_korean.py list               # show all words
   uv run anki_korean.py list --search 사람
   uv run anki_korean.py list --deck reference
+  uv run anki_korean.py list --deleted     # show words queued for deletion
   uv run anki_korean.py remove "이야기"
 """
 
 import argparse
 import hashlib
+import html
+import json
 import re
 import sqlite3
 import sys
-from datetime import date
+import urllib.error
+import urllib.request
+from datetime import date, datetime
 from pathlib import Path
+from typing import Any
 
 try:
     import genanki
@@ -34,6 +42,9 @@ VOCAB_DECK_ID    = 1_953_742_187
 VOCAB_MODEL_ID   = 1_607_392_319
 REF_DECK_ID      = 1_953_742_188
 REF_MODEL_ID     = 1_607_392_320
+
+VOCAB_DECK_NAME  = "Korean - Vocabulary"
+REF_DECK_NAME    = "Korean - Reference"
 
 # ── Anki models ───────────────────────────────────────────────────────────────
 
@@ -186,20 +197,60 @@ _CREATE_TABLE = """
     )
 """
 
+_NEW_COLUMNS = [
+    ("anki_note_id", "INTEGER"),
+    ("synced_at", "TEXT"),
+    ("pending_delete", "INTEGER NOT NULL DEFAULT 0"),
+]
+
+def _ensure_schema(con: sqlite3.Connection) -> None:
+    con.execute(_CREATE_TABLE)
+    for name, decl in _NEW_COLUMNS:
+        try:
+            con.execute(f"ALTER TABLE words ADD COLUMN {name} {decl}")
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
+
 def load_words() -> dict[str, dict]:
     con = sqlite3.connect(DB_FILE)
-    con.execute(_CREATE_TABLE)
-    rows = con.execute("SELECT korean, back, deck_type, date_added FROM words").fetchall()
+    _ensure_schema(con)
+    rows = con.execute(
+        "SELECT korean, back, deck_type, date_added, anki_note_id, synced_at, pending_delete FROM words"
+    ).fetchall()
     con.close()
-    return {r[0]: {'back': r[1], 'deck_type': r[2], 'date_added': r[3]} for r in rows}
+    return {
+        r[0]: {
+            'back': r[1],
+            'deck_type': r[2],
+            'date_added': r[3],
+            'anki_note_id': r[4],
+            'synced_at': r[5],
+            'pending_delete': r[6] or 0,
+        }
+        for r in rows
+    }
 
 def save_words(words: dict[str, dict]) -> None:
     con = sqlite3.connect(DB_FILE)
-    con.execute(_CREATE_TABLE)
+    _ensure_schema(con)
     con.execute("DELETE FROM words")
     con.executemany(
-        "INSERT INTO words (korean, back, deck_type, date_added) VALUES (?, ?, ?, ?)",
-        [(k, d['back'], d['deck_type'], d['date_added']) for k, d in words.items()],
+        """INSERT INTO words
+           (korean, back, deck_type, date_added, anki_note_id, synced_at, pending_delete)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        [
+            (
+                k,
+                d['back'],
+                d['deck_type'],
+                d['date_added'],
+                d.get('anki_note_id'),
+                d.get('synced_at'),
+                d.get('pending_delete', 0),
+            )
+            for k, d in words.items()
+        ],
     )
     con.commit()
     con.close()
@@ -207,6 +258,293 @@ def save_words(words: dict[str, dict]) -> None:
 
 def stable_guid(korean: str) -> int:
     return int(hashlib.md5(korean.encode()).hexdigest(), 16) % (10 ** 10)
+
+
+def active_words(words: dict[str, dict]) -> dict[str, dict]:
+    return {k: d for k, d in words.items() if not d.get('pending_delete')}
+
+# ── AnkiConnect client ──────────────────────────────────────────────────────
+
+ANKICONNECT_URL = "http://127.0.0.1:8765"
+MIN_ANKICONNECT_VERSION = 6
+
+
+class AnkiConnectError(Exception):
+    pass
+
+
+def anki_connect(action: str, **params) -> Any:
+    payload = json.dumps({"action": action, "version": MIN_ANKICONNECT_VERSION, "params": params}).encode("utf-8")
+    req = urllib.request.Request(ANKICONNECT_URL, data=payload, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError as e:
+        raise AnkiConnectError(
+            f"Couldn't reach AnkiConnect at {ANKICONNECT_URL}. "
+            "Make sure Anki desktop is open and the AnkiConnect add-on "
+            "(Tools → Add-ons → code 2055492159) is installed."
+        ) from e
+    except json.JSONDecodeError as e:
+        raise AnkiConnectError("AnkiConnect returned a response that wasn't valid JSON.") from e
+
+    if not isinstance(body, dict) or "result" not in body or "error" not in body:
+        raise AnkiConnectError(f"Unexpected AnkiConnect response shape: {body!r}")
+    if body["error"] is not None:
+        raise AnkiConnectError(f"AnkiConnect error for action '{action}': {body['error']}")
+    return body["result"]
+
+
+def check_ankiconnect(fail_hard: bool = True) -> bool:
+    try:
+        version = anki_connect("version")
+    except AnkiConnectError as e:
+        print(f"Cannot connect to Anki:\n  {e}")
+        if fail_hard:
+            sys.exit(1)
+        return False
+
+    if not isinstance(version, int):
+        print(f"Cannot connect to Anki:\n  AnkiConnect returned an unexpected version value: {version!r}")
+        if fail_hard:
+            sys.exit(1)
+        return False
+
+    if version < MIN_ANKICONNECT_VERSION:
+        print(
+            f"AnkiConnect API version {version} is older than the version this tool expects "
+            f"({MIN_ANKICONNECT_VERSION}+). Update the AnkiConnect add-on in Anki "
+            "(Tools → Add-ons → Check for updates) and try again."
+        )
+        if fail_hard:
+            sys.exit(1)
+        return False
+
+    return True
+
+
+def ensure_deck_and_model(deck_name: str, model_name: str, model_def: genanki.Model) -> None:
+    existing_decks = anki_connect("deckNames")
+    if deck_name not in existing_decks:
+        anki_connect("createDeck", deck=deck_name)
+
+    existing_models = anki_connect("modelNames")
+    if model_name not in existing_models:
+        anki_connect(
+            "createModel",
+            modelName=model_name,
+            inOrderFields=[f["name"] for f in model_def.fields],
+            css=model_def.css,
+            cardTemplates=[
+                {"Name": t["name"], "Front": t["qfmt"], "Back": t["afmt"]}
+                for t in model_def.templates
+            ],
+        )
+
+
+_HTML_BLOCK_BOUNDARY = re.compile(r'<br\s*/?>|</div>|</p>', re.IGNORECASE)
+_HTML_TAG = re.compile(r'<[^>]+>')
+
+
+def html_to_text(value: str) -> str:
+    """Best-effort conversion of Anki's stored field HTML to plain text."""
+    text = _HTML_BLOCK_BOUNDARY.sub('\n', value)
+    text = _HTML_TAG.sub('', text)
+    text = html.unescape(text)
+    lines = [line.strip() for line in text.splitlines()]
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+    return '\n'.join(lines)
+
+
+def escape_anki_query_value(value: str) -> str:
+    return value.replace('"', '\\"')
+
+
+def deck_model_for(deck_type: str) -> tuple[str, str]:
+    if deck_type == 'vocab':
+        return VOCAB_DECK_NAME, "Korean Vocabulary"
+    return REF_DECK_NAME, "Korean Reference"
+
+
+def fields_for(korean: str, data: dict) -> dict:
+    if data['deck_type'] == 'vocab':
+        return {"Korean": korean, "Back": data['back'], "DateAdded": data['date_added']}
+    return {"Korean": korean, "DateAdded": data['date_added']}
+
+
+def prompt_yes_no(question: str, default_yes: bool = True) -> bool:
+    suffix = "[Y/n]" if default_yes else "[y/N]"
+    answer = input(f"{question} {suffix} ").strip().lower()
+    if not answer:
+        return default_yes
+    return answer.startswith('y')
+
+
+def run_sync(no_ankiweb_sync: bool, no_interactive: bool, fail_hard: bool = True) -> bool:
+    if not check_ankiconnect(fail_hard=fail_hard):
+        return False
+
+    interactive = not no_interactive and sys.stdin.isatty()
+
+    words = load_words()
+    active = active_words(words)
+    if not active:
+        print("No words yet. Use 'parse' or 'add' first.")
+        return False
+
+    ensure_deck_and_model(VOCAB_DECK_NAME, "Korean Vocabulary", vocab_model)
+    ensure_deck_and_model(REF_DECK_NAME, "Korean Reference", ref_model)
+
+    # ── Flush soft-deletes ──────────────────────────────────────────────────
+    pending = {k: d for k, d in words.items() if d.get('pending_delete')}
+    if pending:
+        note_ids = [d['anki_note_id'] for d in pending.values() if d.get('anki_note_id')]
+        if note_ids:
+            try:
+                anki_connect("deleteNotes", notes=note_ids)
+            except AnkiConnectError as e:
+                print(f"Warning: failed to delete some notes from Anki: {e}")
+        for k in pending:
+            del words[k]
+        print(f"{len(pending)} word(s) deleted from Anki and word list.")
+
+    # ── Batch-fetch live state for remaining active words ──────────────────
+    note_id_to_korean: dict[int, str] = {
+        d['anki_note_id']: k for k, d in active.items() if d.get('anki_note_id')
+    }
+    notes_info_by_id: dict[int, dict] = {}
+    if note_id_to_korean:
+        try:
+            infos = anki_connect("notesInfo", notes=list(note_id_to_korean.keys()))
+            for info in infos:
+                if info.get('noteId'):
+                    notes_info_by_id[info['noteId']] = info
+        except AnkiConnectError as e:
+            print(f"Warning: failed to fetch live note info from Anki: {e}")
+
+    added = updated = errors = 0
+    newly_deleted = 0
+    conflicts: list[str] = []
+    now = datetime.now().isoformat(timespec='seconds')
+
+    for korean, data in active.items():
+        deck_name, model_name = deck_model_for(data['deck_type'])
+        fields = fields_for(korean, data)
+        note_id = data.get('anki_note_id')
+
+        try:
+            if not note_id:
+                try:
+                    new_id = anki_connect(
+                        "addNote",
+                        note={
+                            "deckName": deck_name,
+                            "modelName": model_name,
+                            "fields": fields,
+                            "options": {"allowDuplicate": False},
+                        },
+                    )
+                    data['anki_note_id'] = new_id
+                    data['synced_at'] = now
+                    added += 1
+                    print(f"  + {korean}")
+                except AnkiConnectError as e:
+                    if 'duplicate' not in str(e).lower():
+                        raise
+                    # Anki's duplicate check is scoped to the note type across the whole
+                    # collection, not just this deck — e.g. the note may already exist from
+                    # an earlier .apkg import. Look it up and link to it instead of erroring.
+                    query = f'note:"{model_name}" Korean:"{escape_anki_query_value(korean)}"'
+                    found = anki_connect("findNotes", query=query)
+                    if not found:
+                        raise
+                    note_id = found[0]
+                    anki_connect("updateNoteFields", note={"id": note_id, "fields": fields})
+                    data['anki_note_id'] = note_id
+                    data['synced_at'] = now
+                    updated += 1
+                    print(f"  = {korean} (linked to existing Anki note)")
+                continue
+
+            info = notes_info_by_id.get(note_id)
+            if info is None:
+                # Stale id — try to re-resolve by field lookup before assuming a real delete.
+                query = f'deck:"{deck_name}" Korean:"{escape_anki_query_value(korean)}"'
+                found = anki_connect("findNotes", query=query)
+                if found:
+                    note_id = found[0]
+                    anki_connect("updateNoteFields", note={"id": note_id, "fields": fields})
+                    data['anki_note_id'] = note_id
+                    data['synced_at'] = now
+                    updated += 1
+                else:
+                    data['pending_delete'] = 1
+                    newly_deleted += 1
+                    print(f"  ~ {korean}: deleted in Anki, removing from word list too (will flush on next sync)")
+                continue
+
+            live_fields = info.get('fields', {})
+            live_korean = live_fields.get('Korean', {}).get('value', korean)
+            if live_korean != korean:
+                errors += 1
+                print(f"  ! {korean}: Korean field in Anki doesn't match ('{live_korean}') — front-field edits aren't supported, skipping")
+                continue
+
+            if data['deck_type'] == 'vocab':
+                live_back_raw = live_fields.get('Back', {}).get('value', '')
+                live_back = html_to_text(live_back_raw)
+                if live_back != data['back']:
+                    if interactive:
+                        print(f"\nConflict for {korean}:")
+                        print(f"  DB value:   {data['back']!r}")
+                        print(f"  Anki value: {live_back!r}")
+                        if prompt_yes_no(f"Adopt Anki's edit for {korean}?", default_yes=True):
+                            data['back'] = live_back
+                            data['synced_at'] = now
+                            updated += 1
+                            continue
+                        # else: fall through and push DB value to Anki below
+                    else:
+                        conflicts.append(korean)
+                        continue
+
+            anki_connect("updateNoteFields", note={"id": note_id, "fields": fields_for(korean, data)})
+            data['synced_at'] = now
+            updated += 1
+        except AnkiConnectError as e:
+            errors += 1
+            print(f"  ! {korean}: {e}")
+
+    words.update(active)
+    save_words(words)
+
+    print(f"\n{added} added, {updated} updated, {newly_deleted} deleted-in-Anki, {errors} error(s).")
+    if errors:
+        print("Some words failed to sync; re-run 'sync' to retry.")
+
+    if conflicts:
+        print(f"\n{len(conflicts)} word(s) have conflicting edits in Anki and require interactive resolution:")
+        for k in conflicts:
+            print(f"  - {k}")
+        print("Re-run 'sync' from an interactive terminal (without --no-interactive) to resolve them.")
+        return False
+
+    if not no_ankiweb_sync:
+        print("\nSyncing with AnkiWeb...")
+        try:
+            anki_connect("sync")
+            print("AnkiWeb sync triggered. Check the Anki desktop window for completion status.")
+        except AnkiConnectError as e:
+            print(
+                f"Local notes were synced to Anki, but triggering AnkiWeb sync failed: {e}\n"
+                "Make sure you're logged into AnkiWeb in Anki desktop (Anki menu → Sync), "
+                "or sync manually by clicking the Sync button in Anki."
+            )
+
+    return True
 
 # ── Commands ──────────────────────────────────────────────────────────────────
 
@@ -233,7 +571,14 @@ def cmd_parse(args):
             if korean in words:
                 skipped += 1
             else:
-                words[korean] = {'back': back, 'deck_type': deck_type, 'date_added': today}
+                words[korean] = {
+                    'back': back,
+                    'deck_type': deck_type,
+                    'date_added': today,
+                    'anki_note_id': None,
+                    'synced_at': None,
+                    'pending_delete': 0,
+                }
                 if deck_type == 'vocab':
                     added_vocab += 1
                     print(f"  + [{deck_type}] {korean} → {back}")
@@ -247,6 +592,17 @@ def cmd_parse(args):
         print(f"\nCouldn't classify ({len(unrecognized)}):")
         for u in unrecognized:
             print(f"  ? {u}")
+
+    # Sync if this run added anything new, or if earlier runs (e.g. parse/add with
+    # --no-sync) left words that were never pushed to Anki, or deletions never flushed.
+    needs_sync = any(
+        d.get('pending_delete') or not d.get('anki_note_id')
+        for d in words.values()
+    )
+    if needs_sync and not args.no_sync:
+        print("\nSyncing words to Anki...")
+        if not run_sync(args.no_ankiweb_sync, no_interactive=False, fail_hard=False):
+            print("Sync skipped or incomplete — words are saved locally; run 'sync' manually later.")
 
 
 def cmd_add(args):
@@ -264,7 +620,14 @@ def cmd_add(args):
                 print(f"  ~ {korean} (already exists)")
                 skipped += 1
             else:
-                words[korean] = {'back': back, 'deck_type': deck_type, 'date_added': today}
+                words[korean] = {
+                    'back': back,
+                    'deck_type': deck_type,
+                    'date_added': today,
+                    'anki_note_id': None,
+                    'synced_at': None,
+                    'pending_delete': 0,
+                }
                 print(f"  + {korean} → {back or '[reference]'}")
                 added += 1
 
@@ -273,14 +636,14 @@ def cmd_add(args):
     print(f"\n{added} added, {skipped} skipped.")
 
 
-def cmd_build(args):
-    words = load_words()
+def cmd_build(_args):
+    words = active_words(load_words())
     if not words:
         print("No words yet. Use 'parse' or 'add' first.")
         sys.exit(1)
 
-    vocab_deck = genanki.Deck(VOCAB_DECK_ID, "Korean - Vocabulary")
-    ref_deck   = genanki.Deck(REF_DECK_ID,   "Korean - Reference")
+    vocab_deck = genanki.Deck(VOCAB_DECK_ID, VOCAB_DECK_NAME)
+    ref_deck   = genanki.Deck(REF_DECK_ID,   REF_DECK_NAME)
 
     for korean, d in words.items():
         if d['deck_type'] == 'vocab':
@@ -307,10 +670,20 @@ def cmd_build(args):
     print("\nImport into Anki: File → Import, then choose 'Update existing notes when first field matches'.")
 
 
+def cmd_sync(args):
+    if not run_sync(args.no_ankiweb_sync, args.no_interactive, fail_hard=True):
+        sys.exit(1)
+
+
 def cmd_list(args):
     words = load_words()
+    if args.deleted:
+        words = {k: d for k, d in words.items() if d.get('pending_delete')}
+    else:
+        words = active_words(words)
+
     if not words:
-        print("No words yet.")
+        print("No matches.")
         return
 
     deck_filter = args.deck
@@ -338,14 +711,14 @@ def cmd_remove(args):
     words = load_words()
     removed = []
     for korean in args.words:
-        if korean in words:
-            del words[korean]
+        if korean in words and not words[korean].get('pending_delete'):
+            words[korean]['pending_delete'] = 1
             removed.append(korean)
-        else:
+        elif korean not in words:
             print(f"  Not found: {korean}")
     if removed:
         save_words(words)
-        print(f"Removed: {', '.join(removed)}")
+        print(f"Marked for deletion (removed from Anki + word list on next sync): {', '.join(removed)}")
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -353,8 +726,10 @@ def main():
     parser = argparse.ArgumentParser(prog='anki_korean', description='Manage your Korean Anki deck.')
     sub = parser.add_subparsers(dest='command', required=True)
 
-    p = sub.add_parser('parse', help='Parse a chat export and add new words')
+    p = sub.add_parser('parse', help='Parse a chat export and add new words (auto-syncs to Anki)')
     p.add_argument('file', metavar='FILE')
+    p.add_argument('--no-sync', action='store_true', help="Don't auto-sync new words to Anki")
+    p.add_argument('--no-ankiweb-sync', action='store_true', help="Push to local Anki but don't trigger AnkiWeb sync")
     p.set_defaults(func=cmd_parse)
 
     p = sub.add_parser('add', help='Manually add word(s)')
@@ -364,9 +739,15 @@ def main():
     p = sub.add_parser('build', help='Generate the .apkg file for Anki')
     p.set_defaults(func=cmd_build)
 
+    p = sub.add_parser('sync', help='Push words directly into a running Anki via AnkiConnect')
+    p.add_argument('--no-ankiweb-sync', action='store_true', help="Don't trigger AnkiWeb sync after updating local Anki")
+    p.add_argument('--no-interactive', action='store_true', help="Don't prompt on conflicts; fail instead")
+    p.set_defaults(func=cmd_sync)
+
     p = sub.add_parser('list', help='List words')
     p.add_argument('--search', '-s', metavar='QUERY')
     p.add_argument('--deck', choices=['vocab', 'reference'])
+    p.add_argument('--deleted', action='store_true', help='Show only words queued for deletion')
     p.set_defaults(func=cmd_list)
 
     p = sub.add_parser('remove', help='Remove word(s)')
