@@ -13,17 +13,17 @@ Words are stored in a local SQLite database, which is always the source of truth
 
 ```
 # After each lesson:
-uv run anki_korean.py parse lesson2.txt   # extract new words, then auto-sync into Anki + AnkiWeb
+uv run anki-kr parse lesson2.txt   # extract new words, then auto-sync into Anki + AnkiWeb
 ```
 
-`parse` pushes new words directly into a running Anki desktop via AnkiConnect and triggers an AnkiWeb sync — no manual import needed day-to-day. If Anki isn't open when you run `parse`, the words are still saved locally; sync just gets skipped with a message, and you can push them later with `uv run anki_korean.py sync`.
+`parse` pushes new words directly into a running Anki desktop via AnkiConnect and triggers an AnkiWeb sync — no manual import needed day-to-day. If Anki isn't open when you run `parse`, the words are still saved locally; sync just gets skipped with a message, and you can push them later with `uv run anki-kr sync`.
 
 ### Fallback: building an `.apkg` for manual import
 
 If you'd rather not use AnkiConnect (e.g. setting things up for the first time, or on a machine without Anki installed), `build` still works exactly as before:
 
 ```
-uv run anki_korean.py build               # regenerate korean_deck.apkg
+uv run anki-kr build               # regenerate korean_deck.apkg
 # → Import korean_deck.apkg into Anki
 #   File → Import → "Update existing notes when first field matches"
 ```
@@ -54,7 +54,7 @@ Two decks are used, whether built as an `.apkg` or pushed live via `sync`:
 ### `parse` — extract words from a chat export, then auto-sync
 
 ```
-uv run anki_korean.py parse <file> [--no-sync] [--no-ankiweb-sync]
+uv run anki-kr parse <file> [--no-sync] [--no-ankiweb-sync]
 ```
 
 Reads a chat log, extracts all recognizable vocabulary, and adds new words to the local database. Already-known words are silently skipped. If any new words were added, it then runs the same push-to-Anki flow as `sync` (see below) — unless:
@@ -65,8 +65,8 @@ Reads a chat log, extracts all recognizable vocabulary, and adds new words to th
 A failed auto-sync (Anki not open, AnkiConnect not installed, etc.) never fails the `parse` command itself — the words are already safely saved in the local database, and you'll see a message telling you to run `sync` manually later.
 
 ```
-uv run anki_korean.py parse lesson3.txt
-uv run anki_korean.py parse lesson3.txt --no-sync
+uv run anki-kr parse lesson3.txt
+uv run anki-kr parse lesson3.txt --no-sync
 ```
 
 ---
@@ -74,7 +74,7 @@ uv run anki_korean.py parse lesson3.txt --no-sync
 ### `sync` — push words directly into a running Anki, then AnkiWeb
 
 ```
-uv run anki_korean.py sync [--no-ankiweb-sync] [--no-interactive]
+uv run anki-kr sync [--no-ankiweb-sync] [--no-interactive]
 ```
 
 Pushes every word in the local database into a live Anki collection via [AnkiConnect](https://ankiweb.net/shared/info/2055492159), creating the two decks/note types if they don't exist yet, then triggers Anki's own AnkiWeb sync so your account gets the update too. No AnkiWeb credentials are ever handled by this script — it just asks the already-running, already-logged-in Anki desktop app to do its normal sync.
@@ -108,7 +108,7 @@ This tool treats `words.db` as the source of truth for which words exist and wha
 ### `build` — generate an `.apkg` for manual import
 
 ```
-uv run anki_korean.py build
+uv run anki-kr build
 ```
 
 Generates `korean_deck.apkg` from all (non-deleted) words in the local database. This is the original, Anki-desktop-independent workflow — useful for a first-time setup or a machine without Anki/AnkiConnect available. Kept unchanged alongside `sync`.
@@ -118,13 +118,13 @@ Generates `korean_deck.apkg` from all (non-deleted) words in the local database.
 ### `add` — manually add a word
 
 ```
-uv run anki_korean.py add "korean=english" [...]
+uv run anki-kr add "korean=english" [...]
 ```
 
 Accepts the same formats as the parser. Does not auto-sync — run `sync` afterward if you want it pushed to Anki right away.
 
 ```
-uv run anki_korean.py add "수고하다=to work hard" "눈치=social awareness"
+uv run anki-kr add "수고하다=to work hard" "눈치=social awareness"
 ```
 
 ---
@@ -132,14 +132,14 @@ uv run anki_korean.py add "수고하다=to work hard" "눈치=social awareness"
 ### `list` — review your vocabulary
 
 ```
-uv run anki_korean.py list [--search QUERY] [--deck vocab|reference] [--deleted]
+uv run anki-kr list [--search QUERY] [--deck vocab|reference] [--deleted]
 ```
 
 ```
-uv run anki_korean.py list
-uv run anki_korean.py list --search 사람
-uv run anki_korean.py list --deck reference
-uv run anki_korean.py list --deleted   # words queued for deletion, not yet flushed by sync
+uv run anki-kr list
+uv run anki-kr list --search 사람
+uv run anki-kr list --deck reference
+uv run anki-kr list --deleted   # words queued for deletion, not yet flushed by sync
 ```
 
 ---
@@ -147,11 +147,11 @@ uv run anki_korean.py list --deleted   # words queued for deletion, not yet flus
 ### `remove` — delete a word
 
 ```
-uv run anki_korean.py remove "korean" [...]
+uv run anki-kr remove "korean" [...]
 ```
 
 Marks the word for deletion — it's removed from Anki and the local database the next time you run `sync`.
 
 ```
-uv run anki_korean.py remove "이야기"
+uv run anki-kr remove "이야기"
 ```
