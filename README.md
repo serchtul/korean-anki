@@ -155,3 +155,17 @@ Marks the word for deletion — it's removed from Anki and the local database th
 ```
 uv run anki-kr remove "이야기"
 ```
+
+## Development
+
+### Running tests
+
+```
+uv run pytest
+```
+
+### Test coverage
+
+Currently covered: the pure parsing/detection logic (`korean_anki/parsing.py`), the pure helpers in `korean_anki/sync.py` (`html_to_text`, `escape_anki_query_value`, `deck_model_for`, `fields_for`, `back_field_conflicts`), and `korean_anki/storage.py`'s SQLite round-trip behavior (against a temp DB, never the real `words.db`).
+
+Not yet covered: `korean_anki/ankiconnect.py`'s HTTP client, `run_sync`'s AnkiConnect-driven orchestration and conflict-resolution scenarios, and `korean_anki/cli.py`'s command handlers (they need HTTP/AnkiConnect mocking.)
