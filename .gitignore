@@ -12,6 +12,7 @@ wheels/
 # Generated files
 *.apkg
 *.db
+*.db.bak*
 
 # Lesson chat export files (personal data, not project code)
 *.txt
