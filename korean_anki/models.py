@@ -6,7 +6,12 @@ except ImportError:
     print("Run with: uv run anki-kr")
     sys.exit(1)
 
-from korean_anki.config import VOCAB_MODEL_ID, REF_MODEL_ID
+from korean_anki.config import (
+    REF_MODEL_ID,
+    REF_MODEL_NAME,
+    VOCAB_MODEL_ID,
+    VOCAB_MODEL_NAME,
+)
 
 CARD_CSS = """
 .card {
@@ -24,7 +29,7 @@ hr       { border: none; border-top: 1px solid #e0e0e0; margin: 16px 0; }
 
 vocab_model = genanki.Model(
     VOCAB_MODEL_ID,
-    "Korean Vocabulary",
+    VOCAB_MODEL_NAME,
     fields=[{"name": "Korean"}, {"name": "Back"}, {"name": "DateAdded"}],
     templates=[
         {
@@ -43,7 +48,7 @@ vocab_model = genanki.Model(
 
 ref_model = genanki.Model(
     REF_MODEL_ID,
-    "Korean Reference",
+    REF_MODEL_NAME,
     fields=[{"name": "Korean"}, {"name": "DateAdded"}],
     templates=[{
         "name": "Korean (reference)",

@@ -1,4 +1,9 @@
-from korean_anki.config import REF_DECK_NAME, VOCAB_DECK_NAME
+from korean_anki.config import (
+    REF_DECK_NAME,
+    REF_MODEL_NAME,
+    VOCAB_DECK_NAME,
+    VOCAB_MODEL_NAME,
+)
 from korean_anki.sync import (
     back_field_conflicts,
     deck_model_for,
@@ -25,11 +30,11 @@ def test_escape_anki_query_value_escapes_double_quotes():
 
 
 def test_deck_model_for_vocab():
-    assert deck_model_for("vocab") == (VOCAB_DECK_NAME, "Korean Vocabulary")
+    assert deck_model_for("vocab") == (VOCAB_DECK_NAME, VOCAB_MODEL_NAME)
 
 
 def test_deck_model_for_reference():
-    assert deck_model_for("reference") == (REF_DECK_NAME, "Korean Reference")
+    assert deck_model_for("reference") == (REF_DECK_NAME, REF_MODEL_NAME)
 
 
 def test_fields_for_vocab_includes_back():

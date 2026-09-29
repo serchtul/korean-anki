@@ -81,3 +81,30 @@ def ensure_deck_and_model(deck_name: str, model_name: str, model_def: genanki.Mo
                 for t in model_def.templates
             ],
         )
+        return
+
+    # Importing an .apkg whose model declares an existing model id with a different
+    # schema makes Anki fork the note type under a "+"-suffixed name. Syncing then
+    # writes to one note type while reviews accumulate on the other — silently, with
+    # no error — so refuse to run until the two are merged.
+    forked = f"{model_name}+"
+    if forked in existing_models:
+        raise AnkiConnectError(
+            f'Anki has both "{model_name}" and "{forked}" note types. This happens when '
+            f"an .apkg import forks the note type, and syncing to one while you study the "
+            f"other loses work. Merge them in Anki (Tools → Manage Note Types): move any "
+            f'notes you want to keep onto one type, delete the other, and rename the '
+            f'survivor to "{model_name}".'
+        )
+
+    # Model already exists (e.g. from an earlier version of this tool, or an .apkg
+    # import) — templates added to model_def since then won't exist on it yet, so
+    # notes silently miss those cards. Backfill any missing templates.
+    live_templates = anki_connect("modelTemplates", modelName=model_name)
+    for t in model_def.templates:
+        if t["name"] not in live_templates:
+            anki_connect(
+                "modelTemplateAdd",
+                modelName=model_name,
+                template={"Name": t["name"], "Front": t["qfmt"], "Back": t["afmt"]},
+            )

@@ -9,7 +9,12 @@ from korean_anki.ankiconnect import (
     check_ankiconnect,
     ensure_deck_and_model,
 )
-from korean_anki.config import REF_DECK_NAME, VOCAB_DECK_NAME
+from korean_anki.config import (
+    REF_DECK_NAME,
+    REF_MODEL_NAME,
+    VOCAB_DECK_NAME,
+    VOCAB_MODEL_NAME,
+)
 from korean_anki.models import ref_model, vocab_model
 from korean_anki.storage import active_words, load_words, save_words
 
@@ -36,8 +41,8 @@ def escape_anki_query_value(value: str) -> str:
 
 def deck_model_for(deck_type: str) -> tuple[str, str]:
     if deck_type == 'vocab':
-        return VOCAB_DECK_NAME, "Korean Vocabulary"
-    return REF_DECK_NAME, "Korean Reference"
+        return VOCAB_DECK_NAME, VOCAB_MODEL_NAME
+    return REF_DECK_NAME, REF_MODEL_NAME
 
 
 def fields_for(korean: str, data: dict) -> dict:
@@ -70,8 +75,14 @@ def run_sync(no_ankiweb_sync: bool, no_interactive: bool, fail_hard: bool = True
         print("No words yet. Use 'parse' or 'add' first.")
         return False
 
-    ensure_deck_and_model(VOCAB_DECK_NAME, "Korean Vocabulary", vocab_model)
-    ensure_deck_and_model(REF_DECK_NAME, "Korean Reference", ref_model)
+    try:
+        ensure_deck_and_model(VOCAB_DECK_NAME, VOCAB_MODEL_NAME, vocab_model)
+        ensure_deck_and_model(REF_DECK_NAME, REF_MODEL_NAME, ref_model)
+    except AnkiConnectError as e:
+        print(f"Cannot sync:\n  {e}")
+        if fail_hard:
+            sys.exit(1)
+        return False
 
     # ── Flush soft-deletes ──────────────────────────────────────────────────
     pending = {k: d for k, d in words.items() if d.get('pending_delete')}
@@ -103,6 +114,7 @@ def run_sync(no_ankiweb_sync: bool, no_interactive: bool, fail_hard: bool = True
     added = updated = errors = 0
     newly_deleted = 0
     conflicts: list[str] = []
+    renames: dict[str, str] = {}
     now = datetime.now().isoformat(timespec='seconds')
 
     for korean, data in active.items():
@@ -162,11 +174,35 @@ def run_sync(no_ankiweb_sync: bool, no_interactive: bool, fail_hard: bool = True
                 continue
 
             live_fields = info.get('fields', {})
-            live_korean = live_fields.get('Korean', {}).get('value', korean)
+            # Normalize like the Back field below: Anki stores field HTML, and stray
+            # whitespace or markup in the front field must not look like a real edit.
+            live_korean = html_to_text(live_fields.get('Korean', {}).get('value', korean))
             if live_korean != korean:
-                errors += 1
-                print(f"  ! {korean}: Korean field in Anki doesn't match ('{live_korean}') — front-field edits aren't supported, skipping")
-                continue
+                if not live_korean:
+                    errors += 1
+                    print(f"  ! {korean}: Korean field is empty in Anki, skipping")
+                    continue
+                if live_korean in words or live_korean in renames.values():
+                    errors += 1
+                    print(f"  ! {korean}: Anki's edited front ('{live_korean}') collides with another word already in the DB — resolve manually")
+                    continue
+                if interactive:
+                    print(f"\nFront-field edit for {korean}:")
+                    print(f"  DB value:   {korean!r}")
+                    print(f"  Anki value: {live_korean!r}")
+                    if prompt_yes_no(f"Adopt Anki's edit ({korean!r} -> {live_korean!r})?", default_yes=True):
+                        renames[korean] = live_korean
+                        korean = live_korean
+                        # fall through: still need to check/sync the Back field below,
+                        # which also handles the synced_at/updated bookkeeping
+                    else:
+                        anki_connect("updateNoteFields", note={"id": note_id, "fields": fields_for(korean, data)})
+                        data['synced_at'] = now
+                        updated += 1
+                        continue
+                else:
+                    conflicts.append(korean)
+                    continue
 
             if data['deck_type'] == 'vocab':
                 live_back_raw = live_fields.get('Back', {}).get('value', '')
@@ -194,7 +230,15 @@ def run_sync(no_ankiweb_sync: bool, no_interactive: bool, fail_hard: bool = True
             print(f"  ! {korean}: {e}")
 
     words.update(active)
+    for old_key, new_key in renames.items():
+        if old_key in words:
+            words[new_key] = words.pop(old_key)
     save_words(words)
+
+    if renames:
+        print(f"\n{len(renames)} word(s) renamed from Anki front-field edits:")
+        for old_key, new_key in renames.items():
+            print(f"  {old_key} -> {new_key}")
 
     print(f"\n{added} added, {updated} updated, {newly_deleted} deleted-in-Anki, {errors} error(s).")
     if errors:
